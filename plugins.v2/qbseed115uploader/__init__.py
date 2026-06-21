@@ -26,7 +26,7 @@ class QbSeed115Uploader(_PluginBase):
     plugin_name = "做种上传115"
     plugin_desc = "定时把qBittorrent内做种达到指定时长的种子上传到115，并清理达到保种天数的种子和本地文件。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.7.0"
+    plugin_version = "1.8.3"
     plugin_author = "local"
     author_url = ""
     plugin_config_prefix = "qbseed115uploader_"
@@ -49,6 +49,7 @@ class QbSeed115Uploader(_PluginBase):
 
     _record_key = "upload_records"
     _lock_key = "running_lock"
+    _queue_key = "current_queue"
     _scheduler: Optional[BackgroundScheduler] = None
     _running = False
 
@@ -204,9 +205,10 @@ class QbSeed115Uploader(_PluginBase):
     def get_page(self) -> Optional[List[dict]]:
         """返回详情页面。"""
         records = self._load_records()
+        queue_info = self.get_data(self._queue_key) or {}
+        queue_count = int(queue_info.get("count", 0)) if isinstance(queue_info, dict) else 0
         upload_count = sum(1 for item in records.values() if isinstance(item, dict) and item.get("status") == "uploaded")
         delete_count = sum(1 for item in records.values() if isinstance(item, dict) and item.get("status") == "deleted")
-        uploading_count = sum(1 for item in records.values() if isinstance(item, dict) and item.get("status") == "uploading")
         rows = []
         for item in sorted(records.values(), key=lambda x: int(x.get("time", 0)) if isinstance(x, dict) else 0, reverse=True)[:30]:
             title = item.get("name") or item.get("hash") or "未知种子"
@@ -218,7 +220,7 @@ class QbSeed115Uploader(_PluginBase):
                 "props": {"title": title[:80], "subtitle": f"{dt} | {status_text}"},
             })
         return [
-            {"component": "VAlert", "props": {"type": "info", "text": f"上传阈值：{self._upload_hours}小时；删除阈值：{self._delete_days}天；目标目录：{self._target_path}；上传后标签：{self._uploaded_tag}；记录保留：{self._record_keep_days}天；记录数：{len(records)}；上传：{upload_count}；删除：{delete_count}；上传中：{uploading_count}"}},
+            {"component": "VAlert", "props": {"type": "info", "text": f"上传阈值：{self._upload_hours}小时；删除阈值：{self._delete_days}天；目标目录：{self._target_path}；上传后标签：{self._uploaded_tag}；记录保留：{self._record_keep_days}天；记录数：{len(records)}；上传：{upload_count}；删除：{delete_count}；本次队列：{queue_count}"}},
             {"component": "VCard", "props": {"class": "mt-3"}, "content": [
                 {"component": "VCardTitle", "props": {"text": "最近上传/清理记录"}},
                 {"component": "VDivider"},
@@ -294,13 +296,16 @@ class QbSeed115Uploader(_PluginBase):
 
         success, failed, skipped = [], [], []
         threshold = self._upload_hours * 3600
-        due_count = sum(1 for t in torrents if (getattr(t, "seeding_time", 0) or 0) >= threshold)
-        logger.info(f"做种超过上传阈值 {self._upload_hours} 小时的种子总数：{due_count}")
-        for torrent in torrents:
+
+        # 第一步：先遍历出所有达到做种时间阈值的种子
+        due_torrents = [t for t in torrents if (getattr(t, "seeding_time", 0) or 0) >= threshold]
+        logger.info(f"做种超过上传阈值 {self._upload_hours} 小时的种子总数：{len(due_torrents)}")
+
+        # 第二步：统一排除不符合上传要求的种子，生成最终上传队列
+        upload_queue = []
+        for torrent in due_torrents:
             name = torrent.name or "未知"
             torrent_hash = torrent.hash
-            if not torrent.seeding_time or torrent.seeding_time < threshold:
-                continue
             if self._is_excluded(torrent):
                 reason = "排除标签/关键词"
                 logger.info(f"跳过上传：{name}，原因：{reason}")
@@ -309,11 +314,6 @@ class QbSeed115Uploader(_PluginBase):
             record = records.get(torrent_hash)
             if isinstance(record, dict) and record.get("status") in {"uploaded", "uploading"}:
                 reason = "已上传" if record.get("status") == "uploaded" else "正在上传"
-                logger.info(f"跳过上传：{name}，原因：{reason}")
-                skipped.append(f"{name}（{reason}）")
-                continue
-            if torrent_hash in records and not isinstance(record, dict):
-                reason = "旧格式记录已上传"
                 logger.info(f"跳过上传：{name}，原因：{reason}")
                 skipped.append(f"{name}（{reason}）")
                 continue
@@ -328,33 +328,48 @@ class QbSeed115Uploader(_PluginBase):
                 logger.info(f"跳过上传：{name}，原因：{reason}，路径：{local_path}")
                 failed.append(f"{name}（{reason}）")
                 continue
-            records[torrent_hash] = {
-                "hash": torrent_hash,
-                "name": name,
-                "time": int(time.time()),
-                "status": "uploading",
-                "files": 0,
-            }
-            self._save_records(records)
-            ok, file_count = self._upload_path(u115, target_root, local_path, name)
-            if ok:
+            upload_queue.append((torrent, local_path))
+
+        logger.info(f"本次最终上传队列数：{len(upload_queue)}")
+        self.save_data(self._queue_key, {"count": len(upload_queue), "time": int(time.time())})
+
+        # 第三步：开始上传最终队列
+        try:
+            for index, (torrent, local_path) in enumerate(upload_queue, start=1):
+                name = torrent.name or "未知"
+                torrent_hash = torrent.hash
+                logger.info(f"正在上传种子 [{index}/{len(upload_queue)}]：{name}")
                 records = self._load_records()
                 records[torrent_hash] = {
                     "hash": torrent_hash,
                     "name": name,
                     "time": int(time.time()),
-                    "status": "uploaded",
-                    "files": file_count,
+                    "status": "uploading",
+                    "files": 0,
                 }
                 self._save_records(records)
-                self._tag_uploaded_torrent(torrent)
-                success.append(f"{name}（{file_count}个文件）")
-            else:
-                records = self._load_records()
-                if isinstance(records.get(torrent_hash), dict) and records[torrent_hash].get("status") == "uploading":
-                    records.pop(torrent_hash, None)
+                ok, file_count = self._upload_path(u115, target_root, local_path, name)
+                if ok:
+                    records = self._load_records()
+                    records[torrent_hash] = {
+                        "hash": torrent_hash,
+                        "name": name,
+                        "time": int(time.time()),
+                        "status": "uploaded",
+                        "files": file_count,
+                    }
                     self._save_records(records)
-                failed.append(name)
+                    self._tag_uploaded_torrent(torrent)
+                    success.append(f"{name}（{file_count}个文件）")
+                else:
+                    records = self._load_records()
+                    if isinstance(records.get(torrent_hash), dict) and records[torrent_hash].get("status") == "uploading":
+                        records.pop(torrent_hash, None)
+                        self._save_records(records)
+                    failed.append(name)
+        finally:
+            self.save_data(self._queue_key, {"count": 0, "time": int(time.time())})
+
         return {"success": success, "failed": failed, "skipped": skipped}
 
     def _cleanup_due_torrents(self, downloader, torrents: list) -> dict:
