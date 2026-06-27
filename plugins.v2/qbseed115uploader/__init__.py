@@ -26,7 +26,7 @@ class QbSeed115Uploader(_PluginBase):
     plugin_name = "做种上传115"
     plugin_desc = "定时把qBittorrent内做种达到指定时长的种子上传到115，并清理达到保种天数的种子和本地文件。"
     plugin_icon = "upload_a.png"
-    plugin_version = "1.8.3"
+    plugin_version = "1.8.6"
     plugin_author = "local"
     author_url = ""
     plugin_config_prefix = "qbseed115uploader_"
@@ -366,7 +366,7 @@ class QbSeed115Uploader(_PluginBase):
                     if isinstance(records.get(torrent_hash), dict) and records[torrent_hash].get("status") == "uploading":
                         records.pop(torrent_hash, None)
                         self._save_records(records)
-                    failed.append(name)
+                    failed.append(f"{name}（{err}）")
         finally:
             self.save_data(self._queue_key, {"count": 0, "time": int(time.time())})
 
@@ -385,7 +385,7 @@ class QbSeed115Uploader(_PluginBase):
             if not torrent.seeding_time or torrent.seeding_time < threshold:
                 continue
             try:
-                downloader.delete_torrents(delete_files=True, ids=torrent.hash)
+                downloader.delete_torrents(True, torrent.hash)
                 self._remove_local_residual(torrent.content_path)
                 records[f"deleted:{torrent.hash}:{int(time.time())}"] = {
                     "hash": torrent.hash,
@@ -397,7 +397,7 @@ class QbSeed115Uploader(_PluginBase):
                 deleted.append(name)
             except Exception as err:
                 logger.error(f"删除种子失败：{name} - {err}")
-                failed.append(name)
+                failed.append(f"{name}（{err}）")
         return {"deleted": deleted, "failed": failed}
 
     def _upload_path(self, u115: U115Pan, target_root, local_path: Path, torrent_name: str) -> Tuple[bool, int]:
@@ -475,6 +475,8 @@ class QbSeed115Uploader(_PluginBase):
                 shutil.rmtree(local_path)
             else:
                 local_path.unlink()
+        except FileNotFoundError:
+            return
         except Exception as err:
             logger.warning(f"清理残留文件失败：{local_path} - {err}")
 
@@ -542,6 +544,8 @@ class QbSeed115Uploader(_PluginBase):
             *[f"  ❌ {item}" for item in upload_report.get("failed", [])[:10]],
             f"删除种子：{len(cleanup_report.get('deleted', []))} 个",
             *[f"  🗑️ {item}" for item in cleanup_report.get("deleted", [])[:20]],
+            f"删除失败：{len(cleanup_report.get('failed', []))} 个",
+            *[f"  ⚠️ {item}" for item in cleanup_report.get("failed", [])[:10]],
         ]
         return "\n".join(lines)
 
